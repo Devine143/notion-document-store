@@ -11,13 +11,12 @@ import logging
 import os
 import asyncio
 import time
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from datetime import datetime
 
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
-from enum import Enum
+from mcp.server.fastmcp import FastMCP
+from mcp.types import TextContent
+import click
 
 from .modules.notion_client import NotionClient, NotionAPIError
 from .modules.data_types import (
@@ -28,15 +27,23 @@ from .modules.data_types import (
     ErrorResponse,
     SuccessResponse
 )
+from .health_server import start_health_server
 
 # Configure logging
+handlers = [logging.StreamHandler()]
+
+# Add file handler only if not in Docker (detected by environment)
+if not os.getenv('DOCKER_CONTAINER'):
+    try:
+        handlers.append(logging.FileHandler('/app/logs/notion_doc_store.log', mode='a'))
+    except (PermissionError, OSError):
+        # Fall back to just console logging if file logging fails
+        pass
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('notion_doc_store.log', mode='a')
-    ]
+    handlers=handlers
 )
 logger = logging.getLogger(__name__)
 
@@ -52,12 +59,13 @@ if not NOTION_DATABASE_ID:
     raise ValueError("NOTION_DATABASE_ID environment variable is required")
 
 
-class DocumentTools(str, Enum):
-    """Available MCP tools for document management."""
-    ADD_DOCUMENT = "add_document"
-    SEARCH_DOCUMENTS = "search_documents"
-    GET_DOCUMENT = "get_document"
+# Initialize FastMCP server
+mcp = FastMCP("notion-document-store")
 
+
+# Global variables
+notion_client: Optional[NotionClient] = None
+health_runner = None
 
 # Global metrics tracking
 server_metrics = {
@@ -66,9 +74,9 @@ server_metrics = {
     "requests_success": 0,
     "requests_failed": 0,
     "tools_called": {
-        DocumentTools.ADD_DOCUMENT: 0,
-        DocumentTools.SEARCH_DOCUMENTS: 0,
-        DocumentTools.GET_DOCUMENT: 0
+        "add_document": 0,
+        "search_documents": 0,
+        "get_document": 0
     }
 }
 
@@ -174,8 +182,10 @@ def format_search_results(search_response: Dict[str, Any]) -> str:
     return "\n".join(output)
 
 
-async def serve_mcp():
-    """Start the MCP server with comprehensive error handling."""
+async def initialize_server():
+    """Initialize Notion client and health server."""
+    global notion_client, health_runner
+    
     logger.info("Starting Notion Document Store MCP Server")
     logger.info(f"Database ID: {NOTION_DATABASE_ID}")
     logger.info(f"API Version: {NOTION_API_VERSION}")
@@ -200,170 +210,200 @@ async def serve_mcp():
         logger.error(f"Failed to initialize Notion client: {e}")
         raise
     
-    # Initialize MCP server
-    server = Server("notion-document-store")
-    
-    @server.list_tools()
-    async def list_tools() -> List[Tool]:
-        """List available MCP tools."""
-        return [
-            Tool(
-                name=DocumentTools.ADD_DOCUMENT,
-                description="Add a new document to your Notion knowledge base. Provide title, content, and optionally tags, category, URL, and notes.",
-                inputSchema=AddDocumentRequest.model_json_schema(),
-            ),
-            Tool(
-                name=DocumentTools.SEARCH_DOCUMENTS,
-                description="Search for documents in your Notion knowledge base. You can search by title keywords and filter by tags or category.",
-                inputSchema=SearchDocumentsRequest.model_json_schema(),
-            ),
-            Tool(
-                name=DocumentTools.GET_DOCUMENT,
-                description="Retrieve a specific document by its Notion page ID. Returns the full document content and metadata.",
-                inputSchema=GetDocumentRequest.model_json_schema(),
-            ),
-        ]
-    
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict) -> List[TextContent]:
-        """Handle MCP tool calls with comprehensive error handling and logging."""
-        start_time = time.time()
-        server_metrics["requests_total"] += 1
-        
-        logger.info(f"Tool called: {name} with arguments: {arguments}")
-        
-        try:
-            if name not in [tool.value for tool in DocumentTools]:
-                raise ValueError(f"Unknown tool: {name}")
-            
-            server_metrics["tools_called"][name] += 1
-            
-            # Route to appropriate handler
-            if name == DocumentTools.ADD_DOCUMENT:
-                result = await handle_add_document(notion_client, arguments)
-            elif name == DocumentTools.SEARCH_DOCUMENTS:
-                result = await handle_search_documents(notion_client, arguments)
-            elif name == DocumentTools.GET_DOCUMENT:
-                result = await handle_get_document(notion_client, arguments)
-            else:
-                raise ValueError(f"Unhandled tool: {name}")
-            
-            # Record success metrics
-            server_metrics["requests_success"] += 1
-            response_time = time.time() - start_time
-            logger.info(f"Tool {name} completed successfully in {response_time:.2f}s")
-            
-            return [TextContent(type="text", text=result)]
-            
-        except NotionAPIError as e:
-            # Handle Notion-specific errors
-            server_metrics["requests_failed"] += 1
-            error_msg = f"❌ Notion API Error: {e}"
-            
-            if e.status_code:
-                error_msg += f" (Status: {e.status_code})"
-            
-            if e.details:
-                error_msg += f"\nDetails: {e.details.get('message', 'No additional details')}"
-            
-            logger.error(f"Notion API error in {name}: {e}")
-            return [TextContent(type="text", text=error_msg)]
-            
-        except ValueError as e:
-            # Handle validation errors
-            server_metrics["requests_failed"] += 1
-            error_msg = f"❌ Validation Error: {str(e)}"
-            logger.error(f"Validation error in {name}: {e}")
-            return [TextContent(type="text", text=error_msg)]
-            
-        except Exception as e:
-            # Handle unexpected errors
-            server_metrics["requests_failed"] += 1
-            error_msg = f"❌ Unexpected Error: {str(e)}"
-            logger.error(f"Unexpected error in {name}: {e}", exc_info=True)
-            return [TextContent(type="text", text=error_msg)]
-
-
-async def handle_add_document(notion_client: NotionClient, arguments: dict) -> str:
-    """Handle add_document tool calls."""
+    # Start health check server in background
     try:
-        # Validate request
-        req = AddDocumentRequest(**arguments)
-        
+        health_runner = await start_health_server(notion_client, server_metrics)
+    except Exception as e:
+        logger.warning(f"Failed to start health check server: {e}")
+        logger.warning("Continuing without health check endpoints...")
+
+
+# FastMCP Tool Decorators
+@mcp.tool()
+async def add_document(
+    title: str,
+    content: str,
+    tags: Optional[List[str]] = None,
+    url: Optional[str] = None,
+    category: Optional[DocumentCategory] = None,
+    notes: Optional[str] = None
+) -> str:
+    """Add a new document to your Notion knowledge base. Provide title, content, and optionally tags, category, URL, and notes."""
+    if not notion_client:
+        await initialize_server()
+    
+    start_time = time.time()
+    server_metrics["requests_total"] += 1
+    server_metrics["tools_called"]["add_document"] += 1
+    
+    logger.info(f"Adding document: {title}")
+    
+    try:
         # Call Notion client
         result = await notion_client.add_document(
-            title=req.title,
-            content=req.content,
-            tags=req.tags,
-            url=req.url,
-            category=req.category,
-            notes=req.notes
+            title=title,
+            content=content,
+            tags=tags or [],
+            url=url,
+            category=category,
+            notes=notes
         )
         
         # Format success response
         response = f"✅ Document added successfully!\n\n{format_document_display(result.dict())}"
         
-        logger.info(f"Document created: {result.id} - {result.title}")
+        # Record success metrics
+        server_metrics["requests_success"] += 1
+        response_time = time.time() - start_time
+        logger.info(f"Document created: {result.id} - {result.title} in {response_time:.2f}s")
+        
         return response
         
     except Exception as e:
+        server_metrics["requests_failed"] += 1
         logger.error(f"Failed to add document: {e}")
-        raise
+        return f"❌ Error adding document: {str(e)}"
 
 
-async def handle_search_documents(notion_client: NotionClient, arguments: dict) -> str:
-    """Handle search_documents tool calls."""
+@mcp.tool()
+async def search_documents(
+    query: str,
+    tags: Optional[List[str]] = None,
+    category: Optional[DocumentCategory] = None,
+    limit: Optional[int] = 10
+) -> str:
+    """Search for documents in your Notion knowledge base. You can search by title keywords and filter by tags or category."""
+    if not notion_client:
+        await initialize_server()
+    
+    start_time = time.time()
+    server_metrics["requests_total"] += 1
+    server_metrics["tools_called"]["search_documents"] += 1
+    
+    logger.info(f"Searching documents: {query}")
+    
     try:
-        # Validate request
-        req = SearchDocumentsRequest(**arguments)
-        
         # Call Notion client
         result = await notion_client.search_documents(
-            query=req.query,
-            tags=req.tags,
-            category=req.category,
-            limit=req.limit
+            query=query,
+            tags=tags,
+            category=category,
+            limit=limit or 10
         )
         
         # Format response
         response = format_search_results(result.dict())
         
-        logger.info(f"Search completed: {result.total_count} results for '{req.query}'")
+        # Record success metrics
+        server_metrics["requests_success"] += 1
+        response_time = time.time() - start_time
+        logger.info(f"Search completed: {result.total_count} results for '{query}' in {response_time:.2f}s")
+        
         return response
         
     except Exception as e:
+        server_metrics["requests_failed"] += 1
         logger.error(f"Failed to search documents: {e}")
-        raise
+        return f"❌ Error searching documents: {str(e)}"
 
 
-async def handle_get_document(notion_client: NotionClient, arguments: dict) -> str:
-    """Handle get_document tool calls."""
+@mcp.tool()
+async def get_document(page_id: str) -> str:
+    """Retrieve a specific document by its Notion page ID. Returns the full document content and metadata."""
+    if not notion_client:
+        await initialize_server()
+    
+    start_time = time.time()
+    server_metrics["requests_total"] += 1
+    server_metrics["tools_called"]["get_document"] += 1
+    
+    logger.info(f"Getting document: {page_id}")
+    
     try:
-        # Validate request
-        req = GetDocumentRequest(**arguments)
-        
         # Call Notion client
-        result = await notion_client.get_document(req.page_id)
+        result = await notion_client.get_document(page_id)
         
         # Format response with full content
         response = f"📖 **Document Retrieved:**\n\n{format_document_display(result.dict(), include_content=True)}"
         
-        logger.info(f"Document retrieved: {result.id} - {result.title}")
+        # Record success metrics
+        server_metrics["requests_success"] += 1
+        response_time = time.time() - start_time
+        logger.info(f"Document retrieved: {result.id} - {result.title} in {response_time:.2f}s")
+        
         return response
         
     except Exception as e:
+        server_metrics["requests_failed"] += 1
         logger.error(f"Failed to get document: {e}")
+        return f"❌ Error retrieving document: {str(e)}"
+
+
+async def serve_mcp(transport: str = "stdio"):
+    """Start MCP server with specified transport."""
+    global health_runner
+    
+    # Initialize server components
+    await initialize_server()
+    
+    logger.info(f"🚀 Starting MCP server with {transport} transport")
+    
+    try:
+        # Use FastMCP's built-in transport handling
+        if transport == "sse":
+            await mcp.run_sse_async()
+        else:
+            await mcp.run_stdio_async()
+    except Exception as e:
+        logger.error(f"MCP server error: {e}")
         raise
+    finally:
+        # Cleanup health server
+        if health_runner:
+            try:
+                await health_runner.cleanup()
+                logger.info("Health check server stopped")
+            except Exception as e:
+                logger.warning(f"Error stopping health server: {e}")
+
+
+# Helper function to serve with port binding for SSE
+async def serve_sse_with_port(host: str = "0.0.0.0", port: int = 3000):
+    """Start FastMCP SSE server with custom host/port."""
+    # Initialize server
+    await initialize_server()
+    
+    logger.info(f"🚀 Starting FastMCP SSE server on {host}:{port}")
+    
+    # Set environment variables for FastMCP SSE server
+    os.environ["MCP_SSE_HOST"] = host
+    os.environ["MCP_SSE_PORT"] = str(port)
+    
+    try:
+        await mcp.run_sse_async()
+    except Exception as e:
+        logger.error(f"SSE server error: {e}")
+        raise
+    finally:
+        if health_runner:
+            try:
+                await health_runner.cleanup()
+                logger.info("Health check server stopped")
+            except Exception as e:
+                logger.warning(f"Error stopping health server: {e}")
 
 
 def main():
     """CLI entry point for the MCP server."""
-    import click
     
     @click.command()
     @click.option("-v", "--verbose", count=True, help="Verbose logging (-v for INFO, -vv for DEBUG)")
-    @click.option("--log-file", default="notion_doc_store.log", help="Log file path")
-    def cli(verbose: int, log_file: str):
+    @click.option("--log-file", default="/app/logs/notion_doc_store.log", help="Log file path")
+    @click.option("--transport", type=click.Choice(['stdio', 'sse']), default='stdio', 
+                  help="Transport type: stdio for local, sse for Docker/HTTP")
+    @click.option("--host", default="0.0.0.0", help="Host for SSE transport")
+    @click.option("--port", default=3000, type=int, help="Port for SSE transport")
+    def cli(verbose: int, log_file: str, transport: str, host: str, port: int):
         """Start the Notion Document Store MCP Server"""
         
         # Configure logging level
@@ -375,26 +415,36 @@ def main():
         else:
             logging.getLogger().setLevel(logging.WARNING)
         
-        # Update log file handler
-        for handler in logging.getLogger().handlers:
-            if isinstance(handler, logging.FileHandler):
-                handler.close()
-                logging.getLogger().removeHandler(handler)
-        
-        file_handler = logging.FileHandler(log_file, mode='a')
-        file_handler.setFormatter(logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        ))
-        logging.getLogger().addHandler(file_handler)
+        # Update log file handler (only if not in Docker)
+        if not os.getenv('DOCKER_CONTAINER'):
+            for handler in logging.getLogger().handlers:
+                if isinstance(handler, logging.FileHandler):
+                    handler.close()
+                    logging.getLogger().removeHandler(handler)
+            
+            try:
+                file_handler = logging.FileHandler(log_file, mode='a')
+                file_handler.setFormatter(logging.Formatter(
+                    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+                ))
+                logging.getLogger().addHandler(file_handler)
+            except (PermissionError, OSError):
+                logger.warning(f"Could not create log file {log_file}, using console only")
         
         logger.info("="*50)
         logger.info("Notion Document Store MCP Server Starting")
         logger.info(f"Log Level: {logging.getLogger().level}")
         logger.info(f"Log File: {log_file}")
+        logger.info(f"Transport: {transport}")
+        if transport == 'sse':
+            logger.info(f"SSE Host: {host}:{port}")
         logger.info("="*50)
         
         try:
-            asyncio.run(serve_mcp())
+            if transport == 'sse':
+                asyncio.run(serve_sse_with_port(host, port))
+            else:
+                asyncio.run(serve_mcp(transport))
         except KeyboardInterrupt:
             logger.info("Server shutdown requested")
         except Exception as e:
