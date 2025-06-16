@@ -29,3 +29,10 @@ dev-dependencies = [
     "flake8>=6.0.0",
     "mypy>=1.0.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+addopts = "-v --tb=short"

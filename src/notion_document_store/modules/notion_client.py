@@ -75,7 +75,7 @@ class NotionClient:
         # Rate limiting tracking
         self._last_request_time = 0.0
         self._request_count = 0
-        self._rate_limit_delay = 0.1  # Minimum delay between requests
+        self._min_delay_between_requests = 0.1  # Minimum delay between requests
         
         # Performance metrics
         self.metrics = {
@@ -100,8 +100,8 @@ class NotionClient:
         current_time = time.time()
         elapsed = current_time - self._last_request_time
         
-        if elapsed < self._rate_limit_delay:
-            await asyncio.sleep(self._rate_limit_delay - elapsed)
+        if elapsed < self._min_delay_between_requests:
+            await asyncio.sleep(self._min_delay_between_requests - elapsed)
         
         self._last_request_time = time.time()
     
@@ -628,16 +628,33 @@ class NotionClient:
             Health status dictionary
         """
         try:
-            start_time = time.time()
-            await self._make_request("GET", f"{self.base_url}/databases/{self.database_id}")
-            response_time = time.time() - start_time
+            import time as time_module  # Use explicit import to avoid conflicts
+            start_time = time_module.time()
             
-            return {
-                "status": "healthy",
-                "response_time": response_time,
-                "database_accessible": True,
-                "metrics": self.get_metrics()
-            }
+            # Simple direct request without rate limiting for health check
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(
+                    f"{self.base_url}/databases/{self.database_id}",
+                    headers=self._get_headers()
+                )
+                
+                response_time = time_module.time() - start_time
+                
+                if response.status_code == 200:
+                    return {
+                        "status": "healthy",
+                        "response_time": response_time,
+                        "database_accessible": True,
+                        "metrics": self.get_metrics()
+                    }
+                else:
+                    return {
+                        "status": "unhealthy",
+                        "error": f"API returned status {response.status_code}",
+                        "database_accessible": False,
+                        "metrics": self.get_metrics()
+                    }
+                    
         except Exception as e:
             return {
                 "status": "unhealthy",
