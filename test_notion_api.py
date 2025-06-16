@@ -31,7 +31,7 @@ class NotionAPITester:
         """Test database access permissions"""
         print("🔍 Testing database access...")
         
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             try:
                 response = await client.get(
                     f"{self.base_url}/databases/{self.database_id}",
@@ -40,7 +40,12 @@ class NotionAPITester:
                 
                 if response.status_code == 200:
                     db_data = response.json()
-                    print(f"✅ Database access successful: {db_data.get('title', [{}])[0].get('plain_text', 'Untitled')}")
+                    title_data = db_data.get('title', [])
+                    if title_data and len(title_data) > 0:
+                        title = title_data[0].get('plain_text', 'Untitled')
+                    else:
+                        title = 'Untitled Database'
+                    print(f"✅ Database access successful: {title}")
                     
                     # Validate required properties
                     properties = db_data.get("properties", {})
@@ -115,7 +120,7 @@ class NotionAPITester:
             ]
         }
         
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             try:
                 response = await client.post(
                     f"{self.base_url}/pages",
@@ -142,7 +147,7 @@ class NotionAPITester:
         """Test document retrieval"""
         print("📖 Testing document retrieval...")
         
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             try:
                 # Get page properties
                 response = await client.get(
@@ -180,7 +185,6 @@ class NotionAPITester:
         print("🔍 Testing document search...")
         
         search_payload = {
-            "database_id": self.database_id,
             "filter": {
                 "property": "Title",
                 "title": {"contains": "Test Document"}
@@ -188,7 +192,7 @@ class NotionAPITester:
             "page_size": 10
         }
         
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             try:
                 response = await client.post(
                     f"{self.base_url}/databases/{self.database_id}/query",
@@ -203,7 +207,6 @@ class NotionAPITester:
                     
                     # Test tag-based search
                     tag_search_payload = {
-                        "database_id": self.database_id,
                         "filter": {
                             "property": "Tags",
                             "multi_select": {"contains": "test"}
@@ -237,7 +240,7 @@ class NotionAPITester:
         """Test error handling scenarios"""
         print("⚠️ Testing error scenarios...")
         
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             # Test 1: Invalid API key
             bad_headers = {
                 "Authorization": "Bearer invalid_key",
